@@ -1,1 +1,1 @@
-# YouTube-Playlist-Analyzer
+# YouTube-Playlist-Scraper
