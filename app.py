@@ -323,7 +323,7 @@ if run_btn and playlist_url:
 
 
 # ============================================================
-# 결과 표시 & 다운로드 (session_state 기반, rerun에도 유지)
+# 결과 표시 & 다운로드 (session_state 기반)
 # ============================================================
 if st.session_state.collected:
     df = st.session_state.df
@@ -341,33 +341,54 @@ if st.session_state.collected:
         use_container_width=True, height=400,
     )
 
+    # ── 다운로드 (rerun 없는 링크 방식) ──
+    import base64
+
+    def make_download_link(data: bytes, filename: str, label: str) -> str:
+        b64 = base64.b64encode(data).decode()
+        return (
+            f'<a href="data:application/octet-stream;base64,{b64}" '
+            f'download="{filename}" '
+            f'style="display:inline-block;padding:0.5rem 1rem;'
+            f'background-color:#FF4B4B;color:white;text-decoration:none;'
+            f'border-radius:0.5rem;font-weight:600;text-align:center;'
+            f'width:100%;box-sizing:border-box;">'
+            f'{label}</a>'
+        )
+
     st.subheader("다운로드")
     d1, d2, d3 = st.columns(3)
 
-    d1.download_button(
-        "CSV",
-        data=st.session_state.csv_data,
-        file_name=st.session_state.csv_name,
-        mime="text/csv",
-        use_container_width=True,
-    )
-
-    d2.download_button(
-        "XLSX",
-        data=st.session_state.xlsx_data,
-        file_name=st.session_state.xlsx_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-
-    if st.session_state.zip_data:
-        d3.download_button(
-            f"자막 ZIP ({st.session_state.zip_format}, {st.session_state.zip_count}개)",
-            data=st.session_state.zip_data,
-            file_name=st.session_state.zip_name,
-            mime="application/zip",
-            use_container_width=True,
+    with d1:
+        st.markdown(
+            make_download_link(
+                st.session_state.csv_data,
+                st.session_state.csv_name,
+                "CSV"
+            ),
+            unsafe_allow_html=True,
         )
+
+    with d2:
+        st.markdown(
+            make_download_link(
+                st.session_state.xlsx_data,
+                st.session_state.xlsx_name,
+                "XLSX"
+            ),
+            unsafe_allow_html=True,
+        )
+
+    with d3:
+        if st.session_state.zip_data:
+            st.markdown(
+                make_download_link(
+                    st.session_state.zip_data,
+                    st.session_state.zip_name,
+                    f"자막 ZIP ({st.session_state.zip_format}, {st.session_state.zip_count}개)"
+                ),
+                unsafe_allow_html=True,
+            )
 
     if errors:
         with st.expander(f"실패 로그 ({len(errors)}건)"):
