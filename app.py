@@ -361,16 +361,26 @@ if run_btn and playlist_url:
 if st.session_state.collected:
     df = st.session_state.df
     errors = st.session_state.errors
-    has_sub = df['subtitle_collected_langs'].astype(str).str.len() > 0
+
+    has_sub_col = 'subtitle_collected_langs'
+    if has_sub_col in df.columns:
+        has_sub = df[has_sub_col].astype(str).str.len() > 0
+        sub_count = has_sub.sum()
+    else:
+        sub_count = 0
 
     c1, c2, c3 = st.columns(3)
     c1.metric("총 영상", f"{len(df)}개")
-    c2.metric("자막 수집", f"{has_sub.sum()}개")
+    c2.metric("자막 수집", f"{sub_count}개")
     c3.metric("실패", f"{len(errors)}개")
 
+    # 표시할 컬럼을 존재하는 것만 필터링
+    display_cols = ['#', 'title', 'channel', 'duration_readable',
+                    'view_count', 'like_count', 'subtitle_collected_langs']
+    display_cols = [c for c in display_cols if c in df.columns]
+
     st.dataframe(
-        df[['#', 'title', 'channel', 'duration_readable',
-            'view_count', 'like_count', 'subtitle_collected_langs']],
+        df[display_cols],
         use_container_width=True, height=400,
     )
 
