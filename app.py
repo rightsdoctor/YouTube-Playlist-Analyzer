@@ -57,7 +57,7 @@ def format_duration(seconds):
 
 
 def read_subtitle_files(video_id, subtitle_dir, ext):
-    pattern = os.path.join(subtitle_dir, f"{video_id}*.{ext}")
+    pattern = os.path.join(subtitle_dir, f"*{video_id}*.{ext}")
     sub_files = glob.glob(pattern)
     result = {}
     for fpath in sub_files:
@@ -109,9 +109,10 @@ with st.sidebar:
         "수동 우선, 없으면 자동": "3", "수동 + 자동 모두": "4",
     }
     sub_choice = sub_mode_map[sub_mode]
-    sub_lang = st.text_input("자막 언어", value="ko", help="예: ko,en,ja 또는 all")
+    sub_lang = st.text_input("자막 언어", value="ko", help="예: ko, en, all")
     output_format = st.selectbox("자막 파일 포맷", ["txt", "srt", "vtt", "docx"])
     run_btn = st.button("수집 시작", type="primary", use_container_width=True)
+
 
 # ============================================================
 # 세션 상태 초기화
@@ -129,11 +130,11 @@ if 'collected' not in st.session_state:
     st.session_state.zip_name = ""
     st.session_state.zip_format = ""
 
+
 # ============================================================
 # 메인 실행
 # ============================================================
 if run_btn and playlist_url:
-
     st.session_state.collected = False
 
     for d in [SUBTITLE_DIR, CONVERTED_DIR]:
@@ -142,25 +143,17 @@ if run_btn and playlist_url:
         os.makedirs(d, exist_ok=True)
 
     with st.status("수집 중...", expanded=True) as status:
-
-        # ── 1단계: 영상 ID 수집 ──
+        # 1단계: 영상 ID 수집
         st.write("플레이리스트 분석 중...")
         result = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "--dump-json",
-             "--no-warnings", "--ignore-errors", playlist_url],
+            ["yt-dlp", "--flat-playlist", "--dump-json", "--no-warnings", "--ignore-errors", playlist_url],
             capture_output=True, text=True, timeout=600,
         )
-        flat_entries = []
-        for line in result.stdout.strip().split('\n'):
-            if line.strip():
-                try:
-                    flat_entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-        video_ids = [e.get('id') or e.get('url', '') for e in flat_entries]
+        flat_entries = [json.loads(line) for line in result.stdout.strip().split('\n') if line.strip()]
+        video_ids = [e.get('id') for e in flat_entries if e.get('id')]
         st.write(f"**{len(video_ids)}개** 영상 감지")
 
-        # ── 2단계: 개별 영상 수집 (병렬, 동시성 5) ──
+        # 2단계: 개별 영상 수집 (병렬)
         st.write("개별 영상 메타데이터 + 자막 수집 중... (병렬 처리)")
         progress = st.progress(0)
         full_entries = []
@@ -175,8 +168,7 @@ if run_btn and playlist_url:
 
             try:
                 res_meta = subprocess.run(
-                    ["yt-dlp", "--skip-download", "--dump-json",
-                     "--no-warnings", "--ignore-errors", url],
+                    ["yt-dlp", "--skip-download", "--dump-json", "--no-warnings", "--ignore-errors", url],
                     capture_output=True, text=True, timeout=30,
                 )
                 if res_meta.stdout.strip():
@@ -186,39 +178,51 @@ if run_btn and playlist_url:
                 error = {'position': idx, 'video_id': vid, 'error': str(e)}
                 return entry, error
 
+            # ==================== 개선된 자막 수집 로직 ====================
+            sub_output_template = f"{SUBTITLE_DIR}/%(id)s.%(lang,none)s.%(ext)s"
+            
             sub_args = [
                 "yt-dlp", "--skip-download", "--no-warnings", "--ignore-errors",
-                "--write-subs", "--convert-subs", INTERNAL_FORMAT,
-                "-o", f"{SUBTITLE_DIR}/{vid}.%(ext)s",
+                "-o", sub_output_template,
             ]
-            if sub_choice == "1":
-                sub_args += ["--no-write-auto-subs"]
-            elif sub_choice == "2":
-                sub_args.remove("--write-subs")
-                sub_args += ["--write-auto-subs"]
-            elif sub_choice in ("3", "4"):
-                sub_args += ["--write-auto-subs"]
-
+            
+            # 자막 종류 선택 (더 명확하고 안정적)
+            if sub_choice in ("1", "3", "4"):
+                sub_args.append("--write-subs")
+            if sub_choice in ("2", "3", "4"):
+                sub_args.append("--write-auto-subs")
+            
             if sub_lang.lower() == "all":
-                sub_args += ["--sub-langs", "all,-live_chat"]
+                sub_args.extend(["--sub-langs", "all,-live_chat"])
             else:
-                sub_args += ["--sub-langs", f"{sub_lang},-live_chat"]
+                sub_args.extend(["--sub-langs", f"{sub_lang},-live_chat"])
+            
             sub_args.append(url)
 
             try:
-                subprocess.run(sub_args, capture_output=True, text=True, timeout=60)
-            except Exception:
-                pass
+                sub_result = subprocess.run(sub_args, capture_output=True, text=True, timeout=45)
+                if sub_result.returncode != 0 and sub_result.stderr.strip():
+                    with lock:
+                        errors.append({
+                            'position': idx,
+                            'video_id': vid,
+                            'error': f"Subtitle download failed: {sub_result.stderr.strip()[-250:]}"
+                        })
+            except Exception as e:
+                with lock:
+                    errors.append({
+                        'position': idx,
+                        'video_id': vid,
+                        'error': f"Subtitle subprocess error: {str(e)}"
+                    })
+            # ============================================================
 
             return entry, error
 
         total = len(video_ids)
-
         with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {
-                executor.submit(process_video, idx, vid): (idx, vid)
-                for idx, vid in enumerate(video_ids, 1)
-            }
+            futures = {executor.submit(process_video, idx, vid): (idx, vid) 
+                      for idx, vid in enumerate(video_ids, 1)}
             for future in as_completed(futures):
                 entry, error = future.result()
                 with lock:
@@ -227,17 +231,19 @@ if run_btn and playlist_url:
                     if error:
                         errors.append(error)
                     completed_count += 1
-                    progress.progress(
-                        completed_count / total,
-                        text=f"[{completed_count}/{total}] 완료"
-                    )
+                    progress.progress(completed_count / total, 
+                                    text=f"[{completed_count}/{total}] 완료")
 
         full_entries.sort(key=lambda x: x.get('_playlist_position', 0))
         progress.progress(1.0, text="수집 완료!")
-        srt_files_found = glob.glob(os.path.join(SUBTITLE_DIR, f"*.{INTERNAL_FORMAT}"))
+        
+        srt_files_found = glob.glob(os.path.join(SUBTITLE_DIR, "*.srt"))
         st.write(f"자막 파일 **{len(srt_files_found)}개** 수집됨")
+        
+        if len(srt_files_found) == 0:
+            st.warning("⚠️ 자막이 수집되지 않았습니다. 'all'로 언어를 변경하거나, 해당 플레이리스트에 실제 자막이 존재하는지 확인하세요.")
 
-        # ── 3단계: txt/docx 변환 ──
+        # 3단계: txt/docx 변환 (기존 로직 유지)
         final_sub_dir = SUBTITLE_DIR
         final_sub_ext = INTERNAL_FORMAT
         converted_count = 0
@@ -297,7 +303,7 @@ if run_btn and playlist_url:
 
         status.update(label=f"수집 완료: {len(full_entries)}개 영상", state="complete")
 
-    # ── 4단계: DataFrame ──
+    # 4단계: DataFrame 구성 (기존 로직 유지)
     rows = []
     for entry in full_entries:
         vid = entry.get('id', '')
@@ -345,22 +351,10 @@ if run_btn and playlist_url:
             row[f'subtitle_text_{lang}'] = text
         rows.append(row)
 
-    if rows:
-        df = pd.DataFrame(rows)
-    else:
-        df = pd.DataFrame(columns=[
-            '#', 'video_url', 'video_id', 'title', 'description', 'channel',
-            'channel_id', 'channel_url', 'uploader', 'channel_follower_count',
-            'upload_date', 'view_count', 'like_count', 'comment_count',
-            'duration_seconds', 'duration_readable', 'categories', 'tags',
-            'language', 'age_limit', 'live_status', 'availability',
-            'thumbnail_url', 'chapters', 'manual_subtitle_langs',
-            'auto_subtitle_langs', 'subtitle_collected_langs',
-        ])
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    # ── 다운로드 데이터를 session_state에 저장 ──
+    # 다운로드 데이터 저장
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-
     st.session_state.csv_data = df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
     st.session_state.csv_name = f"playlist_{timestamp}.csv"
 
@@ -384,52 +378,32 @@ if run_btn and playlist_url:
     st.session_state.errors = errors
     st.session_state.collected = True
 
+
 # ============================================================
-# 결과 표시 & 다운로드 (session_state 기반)
+# 결과 표시
 # ============================================================
 if st.session_state.collected and st.session_state.df is not None and not st.session_state.df.empty:
     df = st.session_state.df
     errors = st.session_state.errors
 
-    if 'subtitle_collected_langs' in df.columns:
-        sub_count = (df['subtitle_collected_langs'].astype(str).str.len() > 0).sum()
-    else:
-        sub_count = 0
+    sub_count = (df['subtitle_collected_langs'].astype(str).str.len() > 0).sum() if 'subtitle_collected_langs' in df.columns else 0
 
     c1, c2, c3 = st.columns(3)
     c1.metric("총 영상", f"{len(df)}개")
     c2.metric("자막 수집", f"{sub_count}개")
     c3.metric("실패", f"{len(errors)}개")
 
-    display_cols = ['#', 'title', 'channel', 'duration_readable',
-                    'view_count', 'like_count', 'subtitle_collected_langs']
+    display_cols = ['#', 'title', 'channel', 'duration_readable', 'view_count', 
+                   'like_count', 'subtitle_collected_langs']
     display_cols = [c for c in display_cols if c in df.columns]
-
     st.dataframe(df[display_cols], use_container_width=True, height=400)
 
     st.subheader("다운로드")
     d1, d2, d3 = st.columns(3)
-
     with d1:
-        st.markdown(
-            make_download_link(
-                st.session_state.csv_data,
-                st.session_state.csv_name,
-                "CSV"
-            ),
-            unsafe_allow_html=True,
-        )
-
+        st.markdown(make_download_link(st.session_state.csv_data, st.session_state.csv_name, "CSV"), unsafe_allow_html=True)
     with d2:
-        st.markdown(
-            make_download_link(
-                st.session_state.xlsx_data,
-                st.session_state.xlsx_name,
-                "XLSX"
-            ),
-            unsafe_allow_html=True,
-        )
-
+        st.markdown(make_download_link(st.session_state.xlsx_data, st.session_state.xlsx_name, "XLSX"), unsafe_allow_html=True)
     with d3:
         if st.session_state.zip_data:
             st.markdown(
@@ -447,4 +421,3 @@ if st.session_state.collected and st.session_state.df is not None and not st.ses
 
 elif run_btn and not playlist_url:
     st.warning("플레이리스트 URL을 입력하세요.")
-    
