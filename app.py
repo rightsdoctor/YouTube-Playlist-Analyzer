@@ -131,15 +131,22 @@ if run_btn and playlist_url:
         video_ids = [e.get('id') or e.get('url', '') for e in flat_entries]
         st.write(f"**{len(video_ids)}개** 영상 감지")
 
-        # ── 2단계: 개별 영상 수집 (메타데이터 + 자막 분리) ──
-        st.write("개별 영상 메타데이터 + 자막 수집 중...")
+        # ── 2단계: 개별 영상 수집 (병렬, 동시성 5) ──
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        st.write("개별 영상 메타데이터 + 자막 수집 중... (병렬 처리)")
         progress = st.progress(0)
         full_entries = []
         errors = []
+        lock = threading.Lock()
+        completed_count = 0
 
-        for idx, vid in enumerate(video_ids, 1):
+        def process_video(idx, vid):
+            """단일 영상의 메타데이터 + 자막을 수집하는 워커 함수"""
             url = f"https://www.youtube.com/watch?v={vid}"
-            progress.progress(idx / len(video_ids), text=f"[{idx}/{len(video_ids)}] {vid}")
+            entry = None
+            error = None
 
             # (A) 메타데이터
             try:
@@ -149,12 +156,11 @@ if run_btn and playlist_url:
                     capture_output=True, text=True, timeout=30,
                 )
                 if res_meta.stdout.strip():
-                    data = json.loads(res_meta.stdout.strip().split('\n')[0])
-                    data['_playlist_position'] = idx
-                    full_entries.append(data)
+                    entry = json.loads(res_meta.stdout.strip().split('\n')[0])
+                    entry['_playlist_position'] = idx
             except Exception as e:
-                errors.append({'position': idx, 'video_id': vid, 'error': str(e)})
-                continue
+                error = {'position': idx, 'video_id': vid, 'error': str(e)}
+                return entry, error
 
             # (B) 자막
             sub_args = [
@@ -181,9 +187,36 @@ if run_btn and playlist_url:
             except Exception:
                 pass
 
+            return entry, error
+
+        total = len(video_ids)
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(process_video, idx, vid): (idx, vid)
+                for idx, vid in enumerate(video_ids, 1)
+            }
+
+            for future in as_completed(futures):
+                entry, error = future.result()
+                with lock:
+                    if entry:
+                        full_entries.append(entry)
+                    if error:
+                        errors.append(error)
+                    completed_count += 1
+                    progress.progress(
+                        completed_count / total,
+                        text=f"[{completed_count}/{total}] 완료"
+                    )
+
+        # position 순서대로 정렬
+        full_entries.sort(key=lambda x: x.get('_playlist_position', 0))
+
         progress.progress(1.0, text="수집 완료!")
         srt_files_found = glob.glob(os.path.join(SUBTITLE_DIR, f"*.{INTERNAL_FORMAT}"))
         st.write(f"자막 파일 **{len(srt_files_found)}개** 수집됨")
+
 
         # ── 3단계: txt/docx 변환 ──
         final_sub_dir = SUBTITLE_DIR
