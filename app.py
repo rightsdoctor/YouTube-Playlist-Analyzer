@@ -100,6 +100,11 @@ with st.sidebar:
 # ============================================================
 # 메인 실행
 # ============================================================
+
+# 세션 상태 초기화
+if 'collected' not in st.session_state:
+    st.session_state.collected = False
+
 if run_btn and playlist_url:
 
     for d in [SUBTITLE_DIR, CONVERTED_DIR]:
@@ -289,9 +294,42 @@ if run_btn and playlist_url:
         rows.append(row)
 
     df = pd.DataFrame(rows)
+
+    # ── 다운로드 데이터를 session_state에 저장 ──
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    st.session_state.csv_data = df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+    st.session_state.csv_name = f"playlist_{timestamp}.csv"
+
+    xlsx_buf = BytesIO()
+    with pd.ExcelWriter(xlsx_buf, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Videos')
+        sub_cols = [c for c in df.columns if c.startswith('subtitle_text_')]
+        if sub_cols:
+            df[['#', 'video_id', 'title'] + sub_cols].to_excel(
+                writer, index=False, sheet_name='Subtitles')
+    st.session_state.xlsx_data = xlsx_buf.getvalue()
+    st.session_state.xlsx_name = f"playlist_{timestamp}.xlsx"
+
+    zip_data, zip_count = zip_directory(final_sub_dir, final_sub_ext)
+    st.session_state.zip_data = zip_data if zip_count > 0 else None
+    st.session_state.zip_count = zip_count
+    st.session_state.zip_name = f"subtitles_{output_format}_{timestamp}.zip"
+    st.session_state.zip_format = output_format
+
+    st.session_state.df = df
+    st.session_state.errors = errors
+    st.session_state.collected = True
+
+
+# ============================================================
+# 결과 표시 & 다운로드 (session_state 기반, rerun에도 유지)
+# ============================================================
+if st.session_state.collected:
+    df = st.session_state.df
+    errors = st.session_state.errors
     has_sub = df['subtitle_collected_langs'].astype(str).str.len() > 0
 
-    # ── 결과 표시 ──
     c1, c2, c3 = st.columns(3)
     c1.metric("총 영상", f"{len(df)}개")
     c2.metric("자막 수집", f"{has_sub.sum()}개")
@@ -303,35 +341,33 @@ if run_btn and playlist_url:
         use_container_width=True, height=400,
     )
 
-    # ── 5단계: 다운로드 ──
     st.subheader("다운로드")
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     d1, d2, d3 = st.columns(3)
 
-    csv_data = df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
-    d1.download_button("CSV", data=csv_data,
-                       file_name=f"playlist_{timestamp}.csv",
-                       mime="text/csv", use_container_width=True)
+    d1.download_button(
+        "CSV",
+        data=st.session_state.csv_data,
+        file_name=st.session_state.csv_name,
+        mime="text/csv",
+        use_container_width=True,
+    )
 
-    xlsx_buf = BytesIO()
-    with pd.ExcelWriter(xlsx_buf, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Videos')
-        sub_cols = [c for c in df.columns if c.startswith('subtitle_text_')]
-        if sub_cols:
-            df[['#', 'video_id', 'title'] + sub_cols].to_excel(
-                writer, index=False, sheet_name='Subtitles')
-    d2.download_button("XLSX", data=xlsx_buf.getvalue(),
-                       file_name=f"playlist_{timestamp}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       use_container_width=True)
+    d2.download_button(
+        "XLSX",
+        data=st.session_state.xlsx_data,
+        file_name=st.session_state.xlsx_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
-    zip_data, zip_count = zip_directory(final_sub_dir, final_sub_ext)
-    if zip_count > 0:
+    if st.session_state.zip_data:
         d3.download_button(
-            f"자막 ZIP ({output_format}, {zip_count}개)",
-            data=zip_data,
-            file_name=f"subtitles_{output_format}_{timestamp}.zip",
-            mime="application/zip", use_container_width=True)
+            f"자막 ZIP ({st.session_state.zip_format}, {st.session_state.zip_count}개)",
+            data=st.session_state.zip_data,
+            file_name=st.session_state.zip_name,
+            mime="application/zip",
+            use_container_width=True,
+        )
 
     if errors:
         with st.expander(f"실패 로그 ({len(errors)}건)"):
