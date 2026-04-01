@@ -25,38 +25,6 @@ st.caption("플레이리스트 URL → 메타데이터 + 자막 → Excel / CSV 
 # ============================================================
 INTERNAL_FORMAT = "srt"
 SUBTITLE_DIR = "subtitles_temp"
-CONVERTED
-
-맞습니다. 아래가 모든 수정 사항을 반영한 `app.py` 전체 코드입니다.
-
-```python
-import streamlit as st
-import json
-import re
-import os
-import glob
-import subprocess
-import shutil
-import zipfile
-import threading
-import base64
-import pandas as pd
-from datetime import datetime
-from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# ============================================================
-# 페이지 설정
-# ============================================================
-st.set_page_config(page_title="YT Playlist Scraper", layout="wide")
-st.title("YouTube Playlist Scraper")
-st.caption("플레이리스트 URL → 메타데이터 + 자막 → Excel / CSV / 자막 파일")
-
-# ============================================================
-# 헬퍼 함수
-# ============================================================
-INTERNAL_FORMAT = "srt"
-SUBTITLE_DIR = "subtitles_temp"
 CONVERTED_DIR = "subtitles_converted"
 
 
@@ -479,3 +447,4 @@ if st.session_state.collected and st.session_state.df is not None and not st.ses
 
 elif run_btn and not playlist_url:
     st.warning("플레이리스트 URL을 입력하세요.")
+    
