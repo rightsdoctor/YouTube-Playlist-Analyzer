@@ -6,12 +6,44 @@ import glob
 import subprocess
 import shutil
 import zipfile
-import threading                                        # ★ 상단으로 이동
-import base64                                           # ★ 상단으로 이동
+import threading
+import base64
 import pandas as pd
 from datetime import datetime
 from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed  # ★ 상단으로 이동
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ============================================================
+# 페이지 설정
+# ============================================================
+st.set_page_config(page_title="YT Playlist Scraper", layout="wide")
+st.title("YouTube Playlist Scraper")
+st.caption("플레이리스트 URL → 메타데이터 + 자막 → Excel / CSV / 자막 파일")
+
+# ============================================================
+# 헬퍼 함수
+# ============================================================
+INTERNAL_FORMAT = "srt"
+SUBTITLE_DIR = "subtitles_temp"
+CONVERTED
+
+맞습니다. 아래가 모든 수정 사항을 반영한 `app.py` 전체 코드입니다.
+
+```python
+import streamlit as st
+import json
+import re
+import os
+import glob
+import subprocess
+import shutil
+import zipfile
+import threading
+import base64
+import pandas as pd
+from datetime import datetime
+from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
 # 페이지 설정
@@ -78,7 +110,7 @@ def zip_directory(dir_path, ext):
     return buf.getvalue(), len(matched)
 
 
-def make_download_link(data: bytes, filename: str, label: str) -> str:  # ★ 상단으로 이동
+def make_download_link(data: bytes, filename: str, label: str) -> str:
     b64 = base64.b64encode(data).decode()
     return (
         f'<a href="data:application/octet-stream;base64,{b64}" '
@@ -114,17 +146,27 @@ with st.sidebar:
     run_btn = st.button("수집 시작", type="primary", use_container_width=True)
 
 # ============================================================
-# 세션 상태 초기화 + 유효성 검증
+# 세션 상태 초기화
 # ============================================================
 if 'collected' not in st.session_state:
     st.session_state.collected = False
+    st.session_state.df = None
+    st.session_state.errors = []
+    st.session_state.csv_data = None
+    st.session_state.csv_name = ""
+    st.session_state.xlsx_data = None
+    st.session_state.xlsx_name = ""
+    st.session_state.zip_data = None
+    st.session_state.zip_count = 0
+    st.session_state.zip_name = ""
+    st.session_state.zip_format = ""
 
-# ★ 이전 세션의 손상된 데이터 방어
-if st.session_state.collected:
-    if not hasattr(st.session_state, 'df') or not isinstance(st.session_state.get('df'), pd.DataFrame):
-        st.session_state.collected = False
-    elif 'subtitle_collected_langs' not in st.session_state.df.columns:
-        st.session_state.collected = False
+# ============================================================
+# 메인 실행
+# ============================================================
+if run_btn and playlist_url:
+
+    st.session_state.collected = False
 
     for d in [SUBTITLE_DIR, CONVERTED_DIR]:
         if os.path.exists(d):
@@ -163,7 +205,6 @@ if st.session_state.collected:
             entry = None
             error = None
 
-            # (A) 메타데이터
             try:
                 res_meta = subprocess.run(
                     ["yt-dlp", "--skip-download", "--dump-json",
@@ -177,7 +218,6 @@ if st.session_state.collected:
                 error = {'position': idx, 'video_id': vid, 'error': str(e)}
                 return entry, error
 
-            # (B) 자막
             sub_args = [
                 "yt-dlp", "--skip-download", "--no-warnings", "--ignore-errors",
                 "--write-subs", "--convert-subs", INTERNAL_FORMAT,
@@ -337,7 +377,6 @@ if st.session_state.collected:
             row[f'subtitle_text_{lang}'] = text
         rows.append(row)
 
-    # ★ DataFrame이 비어있을 때 최소 컬럼 보장
     if rows:
         df = pd.DataFrame(rows)
     else:
@@ -377,15 +416,13 @@ if st.session_state.collected:
     st.session_state.errors = errors
     st.session_state.collected = True
 
-
 # ============================================================
 # 결과 표시 & 다운로드 (session_state 기반)
 # ============================================================
-if st.session_state.collected:
+if st.session_state.collected and st.session_state.df is not None and not st.session_state.df.empty:
     df = st.session_state.df
     errors = st.session_state.errors
 
-    # ★ 컬럼 존재 여부를 안전하게 확인
     if 'subtitle_collected_langs' in df.columns:
         sub_count = (df['subtitle_collected_langs'].astype(str).str.len() > 0).sum()
     else:
@@ -396,7 +433,6 @@ if st.session_state.collected:
     c2.metric("자막 수집", f"{sub_count}개")
     c3.metric("실패", f"{len(errors)}개")
 
-    # ★ 존재하는 컬럼만 표시
     display_cols = ['#', 'title', 'channel', 'duration_readable',
                     'view_count', 'like_count', 'subtitle_collected_langs']
     display_cols = [c for c in display_cols if c in df.columns]
