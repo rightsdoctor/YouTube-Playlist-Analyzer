@@ -6,9 +6,12 @@ import glob
 import subprocess
 import shutil
 import zipfile
+import threading                                        # ★ 상단으로 이동
+import base64                                           # ★ 상단으로 이동
 import pandas as pd
 from datetime import datetime
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed  # ★ 상단으로 이동
 
 # ============================================================
 # 페이지 설정
@@ -75,6 +78,19 @@ def zip_directory(dir_path, ext):
     return buf.getvalue(), len(matched)
 
 
+def make_download_link(data: bytes, filename: str, label: str) -> str:  # ★ 상단으로 이동
+    b64 = base64.b64encode(data).decode()
+    return (
+        f'<a href="data:application/octet-stream;base64,{b64}" '
+        f'download="{filename}" '
+        f'style="display:inline-block;padding:0.5rem 1rem;'
+        f'background-color:#FF4B4B;color:white;text-decoration:none;'
+        f'border-radius:0.5rem;font-weight:600;text-align:center;'
+        f'width:100%;box-sizing:border-box;">'
+        f'{label}</a>'
+    )
+
+
 # ============================================================
 # 사이드바
 # ============================================================
@@ -98,14 +114,18 @@ with st.sidebar:
     run_btn = st.button("수집 시작", type="primary", use_container_width=True)
 
 # ============================================================
-# 메인 실행
-# ============================================================
-
 # 세션 상태 초기화
+# ============================================================
 if 'collected' not in st.session_state:
     st.session_state.collected = False
 
+# ============================================================
+# 메인 실행
+# ============================================================
 if run_btn and playlist_url:
+
+    # ★ 새 수집 시작 시 이전 결과 초기화
+    st.session_state.collected = False
 
     for d in [SUBTITLE_DIR, CONVERTED_DIR]:
         if os.path.exists(d):
@@ -132,9 +152,6 @@ if run_btn and playlist_url:
         st.write(f"**{len(video_ids)}개** 영상 감지")
 
         # ── 2단계: 개별 영상 수집 (병렬, 동시성 5) ──
-        import threading
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         st.write("개별 영상 메타데이터 + 자막 수집 중... (병렬 처리)")
         progress = st.progress(0)
         full_entries = []
@@ -143,7 +160,6 @@ if run_btn and playlist_url:
         completed_count = 0
 
         def process_video(idx, vid):
-            """단일 영상의 메타데이터 + 자막을 수집하는 워커 함수"""
             url = f"https://www.youtube.com/watch?v={vid}"
             entry = None
             error = None
@@ -196,7 +212,6 @@ if run_btn and playlist_url:
                 executor.submit(process_video, idx, vid): (idx, vid)
                 for idx, vid in enumerate(video_ids, 1)
             }
-
             for future in as_completed(futures):
                 entry, error = future.result()
                 with lock:
@@ -210,13 +225,10 @@ if run_btn and playlist_url:
                         text=f"[{completed_count}/{total}] 완료"
                     )
 
-        # position 순서대로 정렬
         full_entries.sort(key=lambda x: x.get('_playlist_position', 0))
-
         progress.progress(1.0, text="수집 완료!")
         srt_files_found = glob.glob(os.path.join(SUBTITLE_DIR, f"*.{INTERNAL_FORMAT}"))
         st.write(f"자막 파일 **{len(srt_files_found)}개** 수집됨")
-
 
         # ── 3단계: txt/docx 변환 ──
         final_sub_dir = SUBTITLE_DIR
@@ -326,7 +338,19 @@ if run_btn and playlist_url:
             row[f'subtitle_text_{lang}'] = text
         rows.append(row)
 
-    df = pd.DataFrame(rows)
+    # ★ DataFrame이 비어있을 때 최소 컬럼 보장
+    if rows:
+        df = pd.DataFrame(rows)
+    else:
+        df = pd.DataFrame(columns=[
+            '#', 'video_url', 'video_id', 'title', 'description', 'channel',
+            'channel_id', 'channel_url', 'uploader', 'channel_follower_count',
+            'upload_date', 'view_count', 'like_count', 'comment_count',
+            'duration_seconds', 'duration_readable', 'categories', 'tags',
+            'language', 'age_limit', 'live_status', 'availability',
+            'thumbnail_url', 'chapters', 'manual_subtitle_langs',
+            'auto_subtitle_langs', 'subtitle_collected_langs',
+        ])
 
     # ── 다운로드 데이터를 session_state에 저장 ──
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -362,10 +386,9 @@ if st.session_state.collected:
     df = st.session_state.df
     errors = st.session_state.errors
 
-    has_sub_col = 'subtitle_collected_langs'
-    if has_sub_col in df.columns:
-        has_sub = df[has_sub_col].astype(str).str.len() > 0
-        sub_count = has_sub.sum()
+    # ★ 컬럼 존재 여부를 안전하게 확인
+    if 'subtitle_collected_langs' in df.columns:
+        sub_count = (df['subtitle_collected_langs'].astype(str).str.len() > 0).sum()
     else:
         sub_count = 0
 
@@ -374,30 +397,12 @@ if st.session_state.collected:
     c2.metric("자막 수집", f"{sub_count}개")
     c3.metric("실패", f"{len(errors)}개")
 
-    # 표시할 컬럼을 존재하는 것만 필터링
+    # ★ 존재하는 컬럼만 표시
     display_cols = ['#', 'title', 'channel', 'duration_readable',
                     'view_count', 'like_count', 'subtitle_collected_langs']
     display_cols = [c for c in display_cols if c in df.columns]
 
-    st.dataframe(
-        df[display_cols],
-        use_container_width=True, height=400,
-    )
-
-    # ── 다운로드 (rerun 없는 링크 방식) ──
-    import base64
-
-    def make_download_link(data: bytes, filename: str, label: str) -> str:
-        b64 = base64.b64encode(data).decode()
-        return (
-            f'<a href="data:application/octet-stream;base64,{b64}" '
-            f'download="{filename}" '
-            f'style="display:inline-block;padding:0.5rem 1rem;'
-            f'background-color:#FF4B4B;color:white;text-decoration:none;'
-            f'border-radius:0.5rem;font-weight:600;text-align:center;'
-            f'width:100%;box-sizing:border-box;">'
-            f'{label}</a>'
-        )
+    st.dataframe(df[display_cols], use_container_width=True, height=400)
 
     st.subheader("다운로드")
     d1, d2, d3 = st.columns(3)
