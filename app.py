@@ -24,14 +24,12 @@ st.caption("플레이리스트 URL → 메타데이터 + 자막 → Excel / CSV 
 # 헬퍼 함수
 # ============================================================
 INTERNAL_FORMAT = "srt"
-# ★ 절대 경로 사용 — Streamlit Cloud에서도 안정적
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SUBTITLE_DIR = os.path.join(BASE_DIR, "subtitles_temp")
 CONVERTED_DIR = os.path.join(BASE_DIR, "subtitles_converted")
 
 
 def check_ffmpeg_available() -> bool:
-    """ffmpeg 설치 여부 확인"""
     try:
         subprocess.run(["ffmpeg", "-version"],
                        capture_output=True, text=True, timeout=5)
@@ -68,28 +66,40 @@ def format_duration(seconds):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def read_subtitle_files(video_id, subtitle_dir, ext):
+def read_subtitle_files(video_id, subtitle_dir, search_exts):
     """
-    ★ 수정: glob 패턴을 더 유연하게.
-    yt-dlp 자막 파일명: {video_id}.{lang}.{ext}
+    ★ 수정: video_id 뒤에 반드시 '.'이 오는 패턴만 매칭.
+    search_exts: 검색할 확장자 리스트 (예: ["srt", "vtt"])
     """
-    # 정확한 패턴: video_id.*.ext
-    pattern = os.path.join(subtitle_dir, f"{video_id}.*.{ext}")
-    sub_files = glob.glob(pattern)
-
-    # fallback: video_id로 시작하는 모든 파일
-    if not sub_files:
-        pattern = os.path.join(subtitle_dir, f"{video_id}*.{ext}")
-        sub_files = glob.glob(pattern)
+    if isinstance(search_exts, str):
+        search_exts = [search_exts]
 
     result = {}
-    for fpath in sub_files:
-        fname = os.path.basename(fpath)
-        # "VIDEO_ID.ko.srt" → lang = "ko"
-        parts = fname.replace(f".{ext}", "").split(".")
-        lang = parts[-1] if len(parts) > 1 else "unknown"
-        with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-            result[lang] = f.read()
+    for ext in search_exts:
+        # ★ 핵심: "VIDEO_ID.lang.ext" 패턴만 정확히 매칭
+        # video_id 뒤에 반드시 '.'이 와야 함 — 다른 영상 ID에 오매칭 방지
+        pattern = os.path.join(subtitle_dir, f"{video_id}.*.{ext}")
+        sub_files = glob.glob(pattern)
+
+        # 만약 "VIDEO_ID.ext" (언어코드 없는) 형태도 있을 수 있으므로
+        exact_file = os.path.join(subtitle_dir, f"{video_id}.{ext}")
+        if os.path.exists(exact_file) and exact_file not in sub_files:
+            sub_files.append(exact_file)
+
+        for fpath in sub_files:
+            fname = os.path.basename(fpath)
+            # "VIDEO_ID.ko.srt" → ["VIDEO_ID", "ko", "srt"]
+            # "VIDEO_ID.srt" → ["VIDEO_ID", "srt"]
+            parts = fname.split(".")
+            if len(parts) >= 3:
+                # VIDEO_ID.lang.ext → lang은 가운데 부분
+                lang = parts[-2]
+            else:
+                lang = "unknown"
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read().strip()
+                if content:  # ★ 빈 파일 제외
+                    result[lang] = content
     return result
 
 
@@ -113,6 +123,21 @@ def make_download_link(data: bytes, filename: str, label: str) -> str:
         f'width:100%;box-sizing:border-box;">'
         f'{label}</a>'
     )
+
+
+def count_unique_videos_with_subs(subtitle_dir, exts):
+    """자막 디렉토리에서 고유 video_id 수를 정확히 카운트"""
+    video_ids_with_subs = set()
+    if isinstance(exts, str):
+        exts = [exts]
+    for ext in exts:
+        for fpath in glob.glob(os.path.join(subtitle_dir, f"*.{ext}")):
+            fname = os.path.basename(fpath)
+            # 첫 번째 '.' 이전이 video_id
+            vid = fname.split('.')[0]
+            if vid and os.path.getsize(fpath) > 0:
+                video_ids_with_subs.add(vid)
+    return video_ids_with_subs
 
 
 # ============================================================
@@ -166,12 +191,9 @@ if run_btn and playlist_url:
 
     st.session_state.collected = False
 
-    # ★ ffmpeg 확인
     has_ffmpeg = check_ffmpeg_available()
     if not has_ffmpeg:
-        st.warning("⚠️ ffmpeg가 설치되어 있지 않습니다. "
-                    "`--convert-subs`를 비활성화하고 원본 자막 포맷으로 수집합니다.\n\n"
-                    "`packages.txt`에 `ffmpeg`를 추가하면 해결됩니다.")
+        st.warning("⚠️ ffmpeg 미설치. `packages.txt`에 `ffmpeg`를 추가하세요.")
 
     for d in [SUBTITLE_DIR, CONVERTED_DIR]:
         if os.path.exists(d):
@@ -210,7 +232,6 @@ if run_btn and playlist_url:
             entry = None
             error = None
 
-            # --- 메타데이터 ---
             try:
                 res_meta = subprocess.run(
                     ["yt-dlp", "--skip-download", "--dump-json",
@@ -226,17 +247,13 @@ if run_btn and playlist_url:
                 return entry, error
 
             # --- 자막 ---
-            # ★ 핵심 수정: -o 템플릿을 자막 전용 옵션으로 변경
             sub_args = [
                 "yt-dlp", "--skip-download",
                 "--no-warnings", "--ignore-errors",
                 "--write-subs",
-                # ★ 자막 전용 출력 템플릿 (--output 대신 -o로 지정하되,
-                #    자막은 항상 video_id.lang.ext 형태로 저장됨)
-                "-o", os.path.join(SUBTITLE_DIR, f"%(id)s.%(ext)s"),
+                "-o", os.path.join(SUBTITLE_DIR, "%(id)s.%(ext)s"),
             ]
 
-            # ★ ffmpeg 있을 때만 --convert-subs 사용
             if has_ffmpeg:
                 sub_args += ["--convert-subs", INTERNAL_FORMAT]
 
@@ -248,40 +265,25 @@ if run_btn and playlist_url:
             elif sub_choice in ("3", "4"):
                 sub_args += ["--write-auto-subs"]
 
-            # ★ 핵심 수정: sub-langs에 와일드카드 패턴 추가
-            # "ko"만 지정하면 "ko-orig", "ko-auto" 등을 놓침
             if sub_lang.lower() == "all":
                 sub_args += ["--sub-langs", "all,-live_chat"]
             else:
-                # "ko" → "ko,ko-*,ko.*" 패턴으로 확장
                 langs = [l.strip() for l in sub_lang.split(',')]
                 expanded = []
                 for l in langs:
                     expanded.append(l)
-                    expanded.append(f"{l}-*")  # ko-orig, ko-auto 등
+                    expanded.append(f"{l}-*")
                 lang_str = ','.join(expanded) + ',-live_chat'
                 sub_args += ["--sub-langs", lang_str]
 
             sub_args.append(url)
 
-            sub_error_msg = ""
             try:
-                sub_result = subprocess.run(
+                subprocess.run(
                     sub_args, capture_output=True, text=True, timeout=120
                 )
-                sub_error_msg = sub_result.stderr
-            except Exception as e:
-                sub_error_msg = str(e)
-
-            # ★ 디버깅: 자막 다운로드 실패 시 에러 정보 수집
-            sub_files_for_vid = glob.glob(
-                os.path.join(SUBTITLE_DIR, f"{vid}.*")
-            )
-            if not sub_files_for_vid and sub_error_msg:
-                # 치명적이지 않으므로 에러 목록에는 추가하지 않되,
-                # entry에 디버깅 정보 첨부
-                if entry:
-                    entry['_sub_debug'] = sub_error_msg[:500]
+            except Exception:
+                pass
 
             return entry, error
 
@@ -308,84 +310,88 @@ if run_btn and playlist_url:
         full_entries.sort(key=lambda x: x.get('_playlist_position', 0))
         progress.progress(1.0, text="수집 완료!")
 
-        # ★ 수정: ffmpeg 없으면 srt 대신 vtt 등 원본 포맷도 검색
+        # ★ 자막 파일 확장자 결정
         if has_ffmpeg:
-            srt_files_found = glob.glob(
-                os.path.join(SUBTITLE_DIR, f"*.{INTERNAL_FORMAT}")
-            )
+            sub_exts_to_search = [INTERNAL_FORMAT]
         else:
-            # ffmpeg 없으면 모든 자막 파일 검색
-            all_sub_files = []
-            for ext in ["srt", "vtt", "srv1", "srv2", "srv3",
-                        "ttml", "ass", "ssa", "json3", "lrc"]:
-                all_sub_files.extend(
-                    glob.glob(os.path.join(SUBTITLE_DIR, f"*.{ext}"))
-                )
-            srt_files_found = all_sub_files
-            if srt_files_found:
-                # 실제로 발견된 확장자 파악
-                found_ext = os.path.splitext(srt_files_found[0])[1].lstrip('.')
-                INTERNAL_FORMAT_ACTUAL = found_ext
-            else:
-                INTERNAL_FORMAT_ACTUAL = INTERNAL_FORMAT
+            sub_exts_to_search = ["srt", "vtt", "srv1", "srv2", "srv3",
+                                  "ttml", "ass", "json3", "lrc"]
 
-        st.write(f"자막 파일 **{len(srt_files_found)}개** 수집됨")
+        # ★ 고유 video_id 기준으로 자막 보유 영상 수 카운트
+        vids_with_subs = count_unique_videos_with_subs(
+            SUBTITLE_DIR, sub_exts_to_search
+        )
 
-        # ★ 디버깅: 자막이 0개면 디렉토리 내용 표시
-        if len(srt_files_found) == 0:
-            all_files_in_dir = os.listdir(SUBTITLE_DIR) if os.path.exists(SUBTITLE_DIR) else []
-            if all_files_in_dir:
-                st.warning(
-                    f"자막 디렉토리에 {len(all_files_in_dir)}개 파일이 있으나 "
-                    f"예상 확장자와 불일치합니다.\n\n"
-                    f"발견된 파일 예시: {all_files_in_dir[:5]}"
-                )
-            else:
-                # 첫 번째 영상의 디버그 정보 표시
-                debug_entries = [e for e in full_entries if e.get('_sub_debug')]
-                if debug_entries:
-                    st.warning(
-                        f"자막 다운로드 실패. yt-dlp 메시지 예시:\n\n"
-                        f"`{debug_entries[0]['_sub_debug'][:300]}`"
-                    )
-                else:
-                    st.info(
-                        "자막 파일이 수집되지 않았습니다. "
-                        "해당 영상들에 요청한 언어의 자막이 없을 수 있습니다."
-                    )
+        # 파일 수도 별도 집계 (ZIP용)
+        all_sub_files = []
+        for ext in sub_exts_to_search:
+            all_sub_files.extend(
+                glob.glob(os.path.join(SUBTITLE_DIR, f"*.{ext}"))
+            )
+        # 빈 파일 제거
+        all_sub_files = [f for f in all_sub_files if os.path.getsize(f) > 0]
+
+        # 실제 사용할 내부 확장자
+        actual_internal_ext = INTERNAL_FORMAT
+        if not has_ffmpeg and all_sub_files:
+            actual_internal_ext = os.path.splitext(
+                all_sub_files[0]
+            )[1].lstrip('.')
+
+        st.write(f"자막 파일 **{len(all_sub_files)}개** 수집됨 "
+                 f"(영상 **{len(vids_with_subs)}개**)")
 
         # ── 3단계: txt/docx 변환 ──
+        # ★ 핵심 수정: 영상 단위로 변환 (파일 단위가 아닌)
         final_sub_dir = SUBTITLE_DIR
-        # ★ ffmpeg 없는 경우 실제 발견된 포맷 사용
-        actual_internal = INTERNAL_FORMAT
-        if not has_ffmpeg and srt_files_found:
-            actual_internal = os.path.splitext(srt_files_found[0])[1].lstrip('.')
-        final_sub_ext = actual_internal
+        final_sub_ext = actual_internal_ext
         converted_count = 0
 
-        if output_format in ("txt", "docx") and srt_files_found:
+        if output_format in ("txt", "docx") and all_sub_files:
             st.write(f"{output_format.upper()} 변환 중...")
             if output_format == "docx":
                 from docx import Document
                 from docx.shared import Pt
 
-            for fpath in srt_files_found:
+            # ★ 영상별로 그룹화하여 변환
+            # video_id → [파일경로, ...]
+            vid_to_files = {}
+            for fpath in all_sub_files:
                 fname = os.path.basename(fpath)
-                # 확장자 제거
-                name_base = os.path.splitext(fname)[0]
-                # 추가 확장자도 제거 (예: ID.ko → ID)
-                vid_from_file = name_base.split('.')[0]
+                vid_from_file = fname.split('.')[0]
+                if vid_from_file not in vid_to_files:
+                    vid_to_files[vid_from_file] = []
+                vid_to_files[vid_from_file].append(fpath)
 
-                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                    raw_content = f.read()
+            for vid_from_file, fpaths in vid_to_files.items():
+                # 모든 언어의 자막을 하나의 파일로 합침
+                all_plain_parts = []
+                for fpath in fpaths:
+                    fname = os.path.basename(fpath)
+                    parts = fname.split(".")
+                    lang = parts[-2] if len(parts) >= 3 else "unknown"
+                    with open(fpath, 'r', encoding='utf-8',
+                              errors='replace') as f:
+                        raw = f.read()
+                    plain = srt_to_plain_text(raw)
+                    if plain.strip():
+                        if len(fpaths) > 1:
+                            all_plain_parts.append(f"[{lang}]\n{plain}")
+                        else:
+                            all_plain_parts.append(plain)
 
-                plain = srt_to_plain_text(raw_content)
+                if not all_plain_parts:
+                    continue
+
+                combined_plain = '\n\n'.join(all_plain_parts)
                 matched_entry = next(
                     (e for e in full_entries if e.get('id') == vid_from_file),
                     {}
                 )
                 title = matched_entry.get('title', vid_from_file)
-                safe_name = re.sub(r'[^\w가-힣\s]', '', title)[:50].strip()
+                safe_name = re.sub(
+                    r'[^\w가-힣\s]', '', title
+                )[:50].strip()
 
                 if output_format == "txt":
                     out_path = os.path.join(
@@ -397,7 +403,7 @@ if run_btn and playlist_url:
                         f.write(f"영상: https://www.youtube.com/watch?v="
                                 f"{vid_from_file}\n")
                         f.write(f"{'=' * 60}\n\n")
-                        f.write(plain)
+                        f.write(combined_plain)
                     converted_count += 1
 
                 elif output_format == "docx":
@@ -412,7 +418,7 @@ if run_btn and playlist_url:
                         f"https://www.youtube.com/watch?v={vid_from_file}"
                     )
                     doc.add_paragraph('─' * 40)
-                    sentences = plain.split('. ')
+                    sentences = combined_plain.split('. ')
                     buffer = []
                     for s in sentences:
                         buffer.append(s.strip())
@@ -432,25 +438,6 @@ if run_btn and playlist_url:
             final_sub_ext = output_format
             st.write(f"변환 완료: **{converted_count}개**")
 
-        elif output_format == "vtt" and has_ffmpeg and srt_files_found:
-            # srt → vtt 변환
-            st.write("VTT 변환 중...")
-            for fpath in srt_files_found:
-                fname = os.path.basename(fpath)
-                out_name = fname.rsplit('.', 1)[0] + '.vtt'
-                out_path = os.path.join(CONVERTED_DIR, out_name)
-                try:
-                    subprocess.run(
-                        ["ffmpeg", "-i", fpath, out_path],
-                        capture_output=True, timeout=30
-                    )
-                    converted_count += 1
-                except Exception:
-                    shutil.copy(fpath, os.path.join(CONVERTED_DIR, fname))
-                    converted_count += 1
-            final_sub_dir = CONVERTED_DIR
-            final_sub_ext = "vtt"
-
         status.update(
             label=f"수집 완료: {len(full_entries)}개 영상",
             state="complete"
@@ -460,19 +447,18 @@ if run_btn and playlist_url:
     rows = []
     for entry in full_entries:
         vid = entry.get('id', '')
-
-        # ★ 수정: ffmpeg 없을 때는 실제 확장자로 검색
-        srt_dict = read_subtitle_files(vid, SUBTITLE_DIR, actual_internal)
-        # fallback: 다른 확장자도 시도
-        if not srt_dict:
-            for try_ext in ["srt", "vtt", "srv1", "ttml", "json3"]:
-                srt_dict = read_subtitle_files(vid, SUBTITLE_DIR, try_ext)
-                if srt_dict:
-                    break
-
+        srt_dict = read_subtitle_files(
+            vid, SUBTITLE_DIR, sub_exts_to_search
+        )
         subtitle_plain = {
             lang: srt_to_plain_text(c) for lang, c in srt_dict.items()
         }
+        # ★ 빈 텍스트인 언어는 제거
+        subtitle_plain = {
+            lang: text for lang, text in subtitle_plain.items()
+            if text.strip()
+        }
+
         manual_subs = (
             list(entry.get('subtitles', {}).keys())
             if entry.get('subtitles') else []
@@ -566,7 +552,7 @@ if run_btn and playlist_url:
     st.session_state.collected = True
 
 # ============================================================
-# 결과 표시 & 다운로드 (session_state 기반)
+# 결과 표시 & 다운로드
 # ============================================================
 if (st.session_state.collected
         and st.session_state.df is not None
@@ -574,9 +560,22 @@ if (st.session_state.collected
     df = st.session_state.df
     errors = st.session_state.errors
 
-    if 'subtitle_collected_langs' in df.columns:
+    # ★ 핵심 수정: metric 계산을 실제 자막 텍스트 존재 여부로 정확히 판단
+    sub_text_cols = [c for c in df.columns if c.startswith('subtitle_text_')]
+    if sub_text_cols:
+        # 자막 텍스트 컬럼 중 하나라도 비어있지 않은 행
+        has_sub_mask = df[sub_text_cols].apply(
+            lambda row: any(
+                str(v).strip() != '' and str(v).strip() != 'nan'
+                for v in row
+            ),
+            axis=1
+        )
+        sub_count = has_sub_mask.sum()
+    elif 'subtitle_collected_langs' in df.columns:
         sub_count = (
-            df['subtitle_collected_langs'].astype(str).str.len() > 0
+            df['subtitle_collected_langs'].astype(str)
+            .apply(lambda x: x.strip() != '' and x.strip() != 'nan')
         ).sum()
     else:
         sub_count = 0
