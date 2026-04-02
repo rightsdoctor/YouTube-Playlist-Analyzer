@@ -311,11 +311,9 @@ if run_btn and playlist_url:
         completed_count = 0
         total = len(video_ids)
 
-        # ★ nonlocal 대신 딕셔너리 사용
         shared = {"consecutive_fail_count": 0, "abort_flag": False}
 
         def process_video(idx, vid):
-            """단일 영상 메타데이터 + 자막 수집"""
             if shared["abort_flag"]:
                 return None, {
                     'position': idx, 'video_id': vid,
@@ -642,7 +640,7 @@ if run_btn and playlist_url:
     st.session_state.collected = True
 
 # ============================================================
-# 결과 표시
+# 결과 표시 (개선: 고유 영상 수 · 중복 수 표시)
 # ============================================================
 if st.session_state.collected and st.session_state.df is not None:
     df = st.session_state.df
@@ -655,6 +653,11 @@ if st.session_state.collected and st.session_state.df is not None:
                 st.dataframe(pd.DataFrame(errors))
         st.stop()
 
+    # ── 고유 영상 / 중복 계산 ──
+    total_rows = len(df)
+    unique_video_ids = df['video_id'].nunique()
+    duplicate_count = total_rows - unique_video_ids
+
     sub_text_cols = [c for c in df.columns if c.startswith('subtitle_text_')]
     if sub_text_cols:
         sub_count = df[sub_text_cols].apply(
@@ -664,16 +667,41 @@ if st.session_state.collected and st.session_state.df is not None:
     else:
         sub_count = 0
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("총 영상", f"{len(df)}개")
-    c2.metric("자막 수집", f"{sub_count}개")
-    c3.metric("실패", f"{len(errors)}개")
+    # ── 메트릭 표시 (4열) ──
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("총 행 수", f"{total_rows}개")
+    c2.metric("고유 영상", f"{unique_video_ids}개",
+              delta=f"중복 {duplicate_count}개" if duplicate_count > 0 else None,
+              delta_color="off")
+    c3.metric("자막 수집", f"{sub_count}개")
+    c4.metric("실패", f"{len(errors)}개")
 
+    # ── 중복 영상 상세 (중복이 있을 때만 표시) ──
+    if duplicate_count > 0:
+        dup_vid_ids = df[df.duplicated(subset='video_id', keep=False)]['video_id'].unique()
+        dup_details = df[df['video_id'].isin(dup_vid_ids)][['#', 'video_id', 'title']].copy()
+        dup_details = dup_details.sort_values(['video_id', '#'])
+
+        with st.expander(
+            f"🔁 중복 영상 {duplicate_count}건 상세 "
+            f"(고유 {len(dup_vid_ids)}개 video_id가 플레이리스트에 2회 이상 등재)",
+            expanded=False
+        ):
+            st.caption(
+                "동일한 video_id가 플레이리스트에 여러 번 포함되어 있습니다. "
+                "자막 파일은 video_id 기준으로 저장되므로, "
+                f"CSV/XLSX에는 **{total_rows}행**이지만 "
+                f"자막 ZIP에는 **{unique_video_ids}개** 파일이 들어 있습니다."
+            )
+            st.dataframe(dup_details, use_container_width=True, hide_index=True)
+
+    # ── 데이터 테이블 ──
     display_cols = ['#', 'title', 'channel', 'duration_readable',
                     'view_count', 'like_count', 'subtitle_collected_langs']
     display_cols = [c for c in display_cols if c in df.columns]
     st.dataframe(df[display_cols], use_container_width=True, height=400)
 
+    # ── 다운로드 ──
     st.subheader("다운로드")
     d1, d2, d3 = st.columns(3)
 
@@ -691,11 +719,15 @@ if st.session_state.collected and st.session_state.df is not None:
 
     with d3:
         if st.session_state.zip_data:
+            zip_label = (
+                f"자막 ZIP ({st.session_state.zip_format}, "
+                f"{st.session_state.zip_count}개 · 고유 영상 기준)"
+            )
             st.markdown(make_download_link(
-                st.session_state.zip_data, st.session_state.zip_name,
-                f"자막 ZIP ({st.session_state.zip_format}, {st.session_state.zip_count}개)"
+                st.session_state.zip_data, st.session_state.zip_name, zip_label
             ), unsafe_allow_html=True)
 
+    # ── 실패 로그 ──
     if errors:
         with st.expander(f"실패 로그 ({len(errors)}건)"):
             st.dataframe(pd.DataFrame(errors))
