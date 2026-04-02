@@ -609,6 +609,15 @@ if run_btn and playlist_url:
 
     df = pd.DataFrame(rows) if rows else pd.DataFrame()
 
+    # ── 중복 영상 표기 (is_duplicate 열 추가) ──
+    if not df.empty and 'video_id' in df.columns:
+        dup_mask = df.duplicated(subset='video_id', keep='first')
+        df.insert(
+            df.columns.get_loc('video_id') + 1,
+            'is_duplicate',
+            dup_mask.map({True: 'Y', False: ''})
+        )
+
     # ── 다운로드 데이터 ──
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -623,7 +632,7 @@ if run_btn and playlist_url:
             df.to_excel(writer, index=False, sheet_name='Videos')
             sub_cols = [c for c in df.columns if c.startswith('subtitle_text_')]
             if sub_cols:
-                df[['#', 'video_id', 'title'] + sub_cols].to_excel(
+                df[['#', 'video_id', 'is_duplicate', 'title'] + sub_cols].to_excel(
                     writer, index=False, sheet_name='Subtitles'
                 )
         st.session_state.xlsx_data = xlsx_buf.getvalue()
@@ -640,7 +649,7 @@ if run_btn and playlist_url:
     st.session_state.collected = True
 
 # ============================================================
-# 결과 표시 (개선: 고유 영상 수 · 중복 수 표시)
+# 결과 표시
 # ============================================================
 if st.session_state.collected and st.session_state.df is not None:
     df = st.session_state.df
@@ -667,7 +676,7 @@ if st.session_state.collected and st.session_state.df is not None:
     else:
         sub_count = 0
 
-    # ── 메트릭 표시 (4열) ──
+    # ── 메트릭 (4열) ──
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("총 행 수", f"{total_rows}개")
     c2.metric("고유 영상", f"{unique_video_ids}개",
@@ -676,10 +685,12 @@ if st.session_state.collected and st.session_state.df is not None:
     c3.metric("자막 수집", f"{sub_count}개")
     c4.metric("실패", f"{len(errors)}개")
 
-    # ── 중복 영상 상세 (중복이 있을 때만 표시) ──
+    # ── 중복 영상 상세 ──
     if duplicate_count > 0:
         dup_vid_ids = df[df.duplicated(subset='video_id', keep=False)]['video_id'].unique()
-        dup_details = df[df['video_id'].isin(dup_vid_ids)][['#', 'video_id', 'title']].copy()
+        dup_details = df[df['video_id'].isin(dup_vid_ids)][
+            ['#', 'video_id', 'is_duplicate', 'title']
+        ].copy()
         dup_details = dup_details.sort_values(['video_id', '#'])
 
         with st.expander(
@@ -691,12 +702,13 @@ if st.session_state.collected and st.session_state.df is not None:
                 "동일한 video_id가 플레이리스트에 여러 번 포함되어 있습니다. "
                 "자막 파일은 video_id 기준으로 저장되므로, "
                 f"CSV/XLSX에는 **{total_rows}행**이지만 "
-                f"자막 ZIP에는 **{unique_video_ids}개** 파일이 들어 있습니다."
+                f"자막 ZIP에는 **{unique_video_ids}개** 파일이 들어 있습니다. "
+                f"is_duplicate 열이 **Y**인 행은 동일 video_id의 중복 항목입니다."
             )
             st.dataframe(dup_details, use_container_width=True, hide_index=True)
 
     # ── 데이터 테이블 ──
-    display_cols = ['#', 'title', 'channel', 'duration_readable',
+    display_cols = ['#', 'title', 'is_duplicate', 'channel', 'duration_readable',
                     'view_count', 'like_count', 'subtitle_collected_langs']
     display_cols = [c for c in display_cols if c in df.columns]
     st.dataframe(df[display_cols], use_container_width=True, height=400)
