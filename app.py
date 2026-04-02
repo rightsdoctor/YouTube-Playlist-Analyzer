@@ -8,6 +8,7 @@ import shutil
 import zipfile
 import threading
 import base64
+import tempfile
 import pandas as pd
 from datetime import datetime
 from io import BytesIO
@@ -26,14 +27,12 @@ st.caption("플레이리스트 URL → 메타데이터 + 자막 → Excel / CSV 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SUBTITLE_DIR = os.path.join(BASE_DIR, "subtitles_temp")
 CONVERTED_DIR = os.path.join(BASE_DIR, "subtitles_converted")
-SUB_EXTS = ["srt", "vtt", "srv1", "srv2", "srv3", "ttml", "ass", "json3", "lrc"]
 
 
 # ============================================================
 # 헬퍼 함수
 # ============================================================
 def run_cmd(args, timeout=120):
-    """subprocess 래퍼 — stdout, stderr, returncode 모두 반환"""
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
         return r.stdout, r.stderr, r.returncode
@@ -44,17 +43,16 @@ def run_cmd(args, timeout=120):
 
 
 def check_ffmpeg():
-    out, err, code = run_cmd(["ffmpeg", "-version"], timeout=5)
+    _, _, code = run_cmd(["ffmpeg", "-version"], timeout=5)
     return code == 0
 
 
 def check_ytdlp():
-    out, err, code = run_cmd(["yt-dlp", "--version"], timeout=10)
+    out, _, code = run_cmd(["yt-dlp", "--version"], timeout=10)
     return out.strip(), code == 0
 
 
 def srt_to_plain_text(content: str) -> str:
-    """SRT/VTT → 순수 텍스트"""
     lines = content.strip().split('\n')
     text_lines = []
     for line in lines:
@@ -88,16 +86,12 @@ def format_duration(seconds):
 
 
 def find_subtitle_files_for_video(video_id, subtitle_dir):
-    """
-    video_id에 정확히 매칭되는 자막 파일만 찾기.
-    파일명 형태: VIDEO_ID.LANG.EXT 또는 VIDEO_ID.EXT
-    """
     results = []
     if not os.path.exists(subtitle_dir):
         return results
+    prefix = video_id + "."
     for fname in os.listdir(subtitle_dir):
-        # 파일명이 video_id로 시작하고, 바로 다음이 '.'인 경우만
-        if fname.startswith(video_id + "."):
+        if fname.startswith(prefix):
             fpath = os.path.join(subtitle_dir, fname)
             if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
                 results.append(fpath)
@@ -105,17 +99,14 @@ def find_subtitle_files_for_video(video_id, subtitle_dir):
 
 
 def parse_subtitle_lang(filepath):
-    """파일 경로에서 언어 코드 추출"""
     fname = os.path.basename(filepath)
-    # VIDEO_ID.lang.ext → parts = [VIDEO_ID, lang, ext]
     parts = fname.rsplit('.', 2)
     if len(parts) == 3:
-        return parts[1]  # lang
+        return parts[1]
     return "unknown"
 
 
 def read_subtitles_for_video(video_id, subtitle_dir):
-    """video_id에 해당하는 모든 자막을 {lang: text} 딕셔너리로 반환"""
     result = {}
     for fpath in find_subtitle_files_for_video(video_id, subtitle_dir):
         lang = parse_subtitle_lang(fpath)
@@ -130,11 +121,10 @@ def read_subtitles_for_video(video_id, subtitle_dir):
 
 
 def count_videos_with_subs(subtitle_dir):
-    """자막 디렉토리에서 고유 video_id 수"""
     vids = set()
-    if not os.path.exists(subtitle_dir):
-        return vids, 0
     total_files = 0
+    if not os.path.exists(subtitle_dir):
+        return vids, total_files
     for fname in os.listdir(subtitle_dir):
         fpath = os.path.join(subtitle_dir, fname)
         if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
@@ -146,7 +136,6 @@ def count_videos_with_subs(subtitle_dir):
 
 
 def zip_directory_all(dir_path, ext):
-    """디렉토리에서 특정 확장자 파일들을 ZIP으로"""
     buf = BytesIO()
     matched = glob.glob(os.path.join(dir_path, f"*.{ext}"))
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -168,6 +157,23 @@ def make_download_link(data: bytes, filename: str, label: str) -> str:
     )
 
 
+def save_cookies_file(uploaded_file):
+    """업로드된 쿠키 파일을 임시 경로에 저장하고 경로 반환"""
+    cookies_path = os.path.join(BASE_DIR, "cookies.txt")
+    with open(cookies_path, 'w', encoding='utf-8') as f:
+        content = uploaded_file.getvalue().decode('utf-8', errors='replace')
+        f.write(content)
+    return cookies_path
+
+
+def build_base_args(cookies_path=None):
+    """공통 yt-dlp 인자"""
+    args = ["yt-dlp", "--no-warnings", "--ignore-errors"]
+    if cookies_path and os.path.exists(cookies_path):
+        args += ["--cookies", cookies_path]
+    return args
+
+
 # ============================================================
 # 사이드바
 # ============================================================
@@ -176,6 +182,21 @@ with st.sidebar:
     playlist_url = st.text_input(
         "플레이리스트 URL",
         placeholder="https://www.youtube.com/playlist?list=..."
+    )
+
+    # ★ 쿠키 파일 업로드
+    st.subheader("인증")
+    cookies_file = st.file_uploader(
+        "cookies.txt 업로드",
+        type=["txt"],
+        help=(
+            "YouTube 봇 차단 우회에 필요합니다.\n\n"
+            "**추출 방법:**\n"
+            "1. Chrome에서 [Get cookies.txt LOCALLY] 확장 설치\n"
+            "2. youtube.com 로그인 상태에서 확장 클릭\n"
+            "3. [Export] → cookies.txt 저장\n"
+            "4. 여기에 업로드"
+        )
     )
 
     st.subheader("자막 옵션")
@@ -220,11 +241,21 @@ if run_btn and playlist_url:
     has_ffmpeg = check_ffmpeg()
 
     if not ytdlp_ok:
-        st.error("yt-dlp를 찾을 수 없습니다. requirements.txt에 yt-dlp를 추가하세요.")
+        st.error("yt-dlp를 찾을 수 없습니다. `requirements.txt`에 `yt-dlp`를 추가하세요.")
         st.stop()
 
-    if not has_ffmpeg:
-        st.warning("ffmpeg 미설치 — packages.txt에 `ffmpeg`를 추가하면 자막 변환 품질이 향상됩니다.")
+    st.caption(f"yt-dlp: `{ytdlp_ver}` / ffmpeg: `{'✓' if has_ffmpeg else '✗'}`")
+
+    # ── 쿠키 처리 ──
+    cookies_path = None
+    if cookies_file is not None:
+        cookies_path = save_cookies_file(cookies_file)
+        st.success("쿠키 파일 로드 완료")
+    else:
+        st.warning(
+            "⚠️ **쿠키 없이 실행합니다.** YouTube가 봇으로 판정하면 수집이 실패할 수 있습니다.\n\n"
+            "실패 시 사이드바에서 `cookies.txt`를 업로드하세요."
+        )
 
     # 디렉토리 초기화
     for d in [SUBTITLE_DIR, CONVERTED_DIR]:
@@ -236,14 +267,15 @@ if run_btn and playlist_url:
 
         # ── 1단계: 플레이리스트 파싱 ──
         st.write("플레이리스트 분석 중...")
-        flat_stdout, flat_stderr, flat_code = run_cmd(
-            ["yt-dlp", "--flat-playlist", "--dump-json",
-             "--no-warnings", "--ignore-errors", playlist_url],
-            timeout=600,
-        )
+        flat_args = build_base_args(cookies_path) + [
+            "--flat-playlist", "--dump-json", playlist_url
+        ]
+        flat_stdout, flat_stderr, flat_code = run_cmd(flat_args, timeout=600)
 
-        if flat_code != 0 and not flat_stdout.strip():
-            st.error(f"플레이리스트 파싱 실패:\n```\n{flat_stderr[:500]}\n```")
+        if not flat_stdout.strip():
+            st.error(f"플레이리스트 파싱 실패:\n```\n{flat_stderr[:800]}\n```")
+            if "Sign in" in flat_stderr or "bot" in flat_stderr:
+                st.info("💡 YouTube 봇 차단입니다. `cookies.txt`를 업로드하세요.")
             st.stop()
 
         flat_entries = []
@@ -254,15 +286,41 @@ if run_btn and playlist_url:
                 except json.JSONDecodeError:
                     continue
 
-        video_ids = [e.get('id') or e.get('url', '') for e in flat_entries]
-        video_ids = [v for v in video_ids if v]  # 빈 ID 제거
+        video_ids = [v for v in
+                     (e.get('id') or e.get('url', '') for e in flat_entries)
+                     if v]
         st.write(f"**{len(video_ids)}개** 영상 감지")
 
         if not video_ids:
-            st.error("영상을 찾을 수 없습니다. URL을 확인하세요.")
+            st.error("영상을 찾을 수 없습니다.")
             st.stop()
 
-        # ── 2단계: 개별 영상 수집 ──
+        # ── 1.5단계: 연결 테스트 (첫 번째 영상) ──
+        st.write("YouTube 연결 테스트 중...")
+        test_url = f"https://www.youtube.com/watch?v={video_ids[0]}"
+        test_args = build_base_args(cookies_path) + [
+            "--skip-download", "--dump-json", test_url
+        ]
+        test_out, test_err, test_code = run_cmd(test_args, timeout=30)
+
+        if not test_out.strip():
+            st.error("YouTube 연결 실패 — 봇 차단 감지")
+            if "Sign in" in test_err or "bot" in test_err:
+                st.error(
+                    "🚫 **YouTube가 이 서버의 접근을 차단하고 있습니다.**\n\n"
+                    "**해결 방법:**\n"
+                    "1. Chrome에서 [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) 확장 설치\n"
+                    "2. youtube.com에 로그인\n"
+                    "3. 확장 아이콘 클릭 → Export → `cookies.txt` 저장\n"
+                    "4. 사이드바에서 파일 업로드 후 다시 실행"
+                )
+            else:
+                st.code(test_err[:500])
+            st.stop()
+
+        st.write("연결 확인 ✓")
+
+        # ── 2단계: 개별 영상 수집 (병렬) ──
         st.write("개별 영상 메타데이터 + 자막 수집 중... (병렬 처리)")
         progress = st.progress(0)
         full_entries = []
@@ -272,45 +330,44 @@ if run_btn and playlist_url:
         total = len(video_ids)
 
         def process_video(idx, vid):
-            """단일 영상 메타데이터 + 자막 수집"""
             url = f"https://www.youtube.com/watch?v={vid}"
             entry = None
             error_info = None
 
             # ── 메타데이터 ──
-            meta_stdout, meta_stderr, meta_code = run_cmd(
-                ["yt-dlp", "--skip-download", "--dump-json",
-                 "--no-warnings", "--ignore-errors", url],
-                timeout=60,
-            )
+            meta_args = build_base_args(cookies_path) + [
+                "--skip-download", "--dump-json", url
+            ]
+            meta_out, meta_err, meta_code = run_cmd(meta_args, timeout=60)
 
-            if meta_stdout.strip():
+            if meta_out.strip():
                 try:
-                    entry = json.loads(meta_stdout.strip().split('\n')[0])
+                    entry = json.loads(meta_out.strip().split('\n')[0])
                     entry['_playlist_position'] = idx
                 except json.JSONDecodeError:
                     error_info = {
                         'position': idx, 'video_id': vid,
                         'error': 'JSON parse error',
-                        'detail': meta_stdout[:200]
+                        'detail': meta_out[:200]
                     }
                     return entry, error_info
             else:
                 error_info = {
                     'position': idx, 'video_id': vid,
                     'error': f"No metadata (code={meta_code})",
-                    'detail': meta_stderr[:300]
+                    'detail': meta_err[:300]
                 }
                 return entry, error_info
 
             # ── 자막 ──
-            sub_args = [
-                "yt-dlp", "--skip-download",
-                "--no-warnings", "--ignore-errors",
+            sub_args = build_base_args(cookies_path) + [
+                "--skip-download",
                 "-o", os.path.join(SUBTITLE_DIR, "%(id)s.%(ext)s"),
             ]
 
-            # 자막 모드별 플래그
+            if has_ffmpeg:
+                sub_args += ["--convert-subs", "srt"]
+
             if sub_choice == "manual_only":
                 sub_args += ["--write-subs", "--no-write-auto-subs"]
             elif sub_choice == "auto_only":
@@ -320,11 +377,6 @@ if run_btn and playlist_url:
             elif sub_choice == "both":
                 sub_args += ["--write-subs", "--write-auto-subs"]
 
-            # ffmpeg이 있으면 srt로 변환
-            if has_ffmpeg:
-                sub_args += ["--convert-subs", "srt"]
-
-            # 언어 필터
             if sub_lang.lower().strip() == "all":
                 sub_args += ["--sub-langs", "all,-live_chat"]
             else:
@@ -340,7 +392,6 @@ if run_btn and playlist_url:
 
             return entry, error_info
 
-        # ── 병렬 실행 ──
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {
                 executor.submit(process_video, idx, vid): (idx, vid)
@@ -353,7 +404,6 @@ if run_btn and playlist_url:
                     entry = None
                     error_info = {'position': '?', 'video_id': '?',
                                   'error': f'Future exception: {exc}'}
-
                 with lock:
                     if entry:
                         full_entries.append(entry)
@@ -368,43 +418,24 @@ if run_btn and playlist_url:
         full_entries.sort(key=lambda x: x.get('_playlist_position', 0))
         progress.progress(1.0, text="수집 완료!")
 
-        # ── 자막 수집 결과 확인 ──
         vids_with_subs, sub_file_count = count_videos_with_subs(SUBTITLE_DIR)
         st.write(f"자막 파일 **{sub_file_count}개** 수집됨 (영상 **{len(vids_with_subs)}개**)")
 
-        # ★ 0개일 때 디버그 정보
-        if sub_file_count == 0:
-            all_files = os.listdir(SUBTITLE_DIR) if os.path.exists(SUBTITLE_DIR) else []
-            if all_files:
-                st.warning(f"디렉토리에 파일 {len(all_files)}개 존재하나 크기 0:\n"
-                           f"`{all_files[:5]}`")
-            # 첫 번째 성공 영상으로 자막 직접 테스트
-            if full_entries:
-                test_vid = full_entries[0].get('id', '')
-                test_url = f"https://www.youtube.com/watch?v={test_vid}"
-                test_args = [
-                    "yt-dlp", "--skip-download", "--write-auto-subs",
-                    "--sub-langs", "ko,ko-*,-live_chat",
-                    "--list-subs", test_url
-                ]
-                test_out, test_err, _ = run_cmd(test_args, timeout=30)
-                with st.expander("자막 디버그 (첫 번째 영상)"):
-                    st.code(test_out[:1000] if test_out else "(stdout 없음)")
-                    st.code(test_err[:1000] if test_err else "(stderr 없음)")
-
-        # ── 3단계: 포맷 변환 (txt/docx) ──
+        # ── 3단계: 포맷 변환 ──
         final_sub_dir = SUBTITLE_DIR
-        final_sub_ext = "srt" if has_ffmpeg else "vtt"
-        converted_count = 0
+        final_sub_ext = "srt"
 
-        # 실제 존재하는 자막 파일의 확장자 파악
         actual_sub_files = []
-        for fname in os.listdir(SUBTITLE_DIR):
-            fpath = os.path.join(SUBTITLE_DIR, fname)
-            if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
-                actual_sub_files.append(fpath)
+        if os.path.exists(SUBTITLE_DIR):
+            for fname in os.listdir(SUBTITLE_DIR):
+                fpath = os.path.join(SUBTITLE_DIR, fname)
+                if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
+                    actual_sub_files.append(fpath)
+
         if actual_sub_files:
             final_sub_ext = os.path.splitext(actual_sub_files[0])[1].lstrip('.')
+
+        converted_count = 0
 
         if output_format in ("txt", "docx") and actual_sub_files:
             st.write(f"{output_format.upper()} 변환 중...")
@@ -412,11 +443,10 @@ if run_btn and playlist_url:
                 from docx import Document
                 from docx.shared import Pt
 
-            # 영상별 그룹화
             vid_to_files = {}
             for fpath in actual_sub_files:
-                vid_from_file = os.path.basename(fpath).split('.')[0]
-                vid_to_files.setdefault(vid_from_file, []).append(fpath)
+                vid_key = os.path.basename(fpath).split('.')[0]
+                vid_to_files.setdefault(vid_key, []).append(fpath)
 
             for vid_key, fpaths in vid_to_files.items():
                 all_plain = []
@@ -471,10 +501,6 @@ if run_btn and playlist_url:
             final_sub_ext = output_format
             st.write(f"변환 완료: **{converted_count}개**")
 
-        # ★ 에러 요약
-        if errors:
-            st.write(f"⚠️ 실패: **{len(errors)}개** 영상")
-
         status.update(
             label=f"수집 완료: {len(full_entries)}개 영상", state="complete"
         )
@@ -484,12 +510,11 @@ if run_btn and playlist_url:
     for entry in full_entries:
         vid = entry.get('id', '')
         sub_raw = read_subtitles_for_video(vid, SUBTITLE_DIR)
-        sub_plain = {}
-        for lang, content in sub_raw.items():
-            text = srt_to_plain_text(content)
-            if text.strip():
-                sub_plain[lang] = text
-
+        sub_plain = {
+            lang: srt_to_plain_text(c)
+            for lang, c in sub_raw.items()
+            if srt_to_plain_text(c).strip()
+        }
         manual_subs = list(entry.get('subtitles', {}).keys()) if entry.get('subtitles') else []
         auto_subs = list(entry.get('automatic_captions', {}).keys()) if entry.get('automatic_captions') else []
         chapters = entry.get('chapters', [])
@@ -550,8 +575,7 @@ if run_btn and playlist_url:
             sub_cols = [c for c in df.columns if c.startswith('subtitle_text_')]
             if sub_cols:
                 df[['#', 'video_id', 'title'] + sub_cols].to_excel(
-                    writer, index=False, sheet_name='Subtitles'
-                )
+                    writer, index=False, sheet_name='Subtitles')
         st.session_state.xlsx_data = xlsx_buf.getvalue()
         st.session_state.xlsx_name = f"playlist_{timestamp}.xlsx"
 
@@ -565,6 +589,11 @@ if run_btn and playlist_url:
     st.session_state.errors = errors
     st.session_state.collected = True
 
+    # ★ 쿠키 파일 정리
+    cookies_cleanup = os.path.join(BASE_DIR, "cookies.txt")
+    if os.path.exists(cookies_cleanup):
+        os.remove(cookies_cleanup)
+
 # ============================================================
 # 결과 표시
 # ============================================================
@@ -576,15 +605,23 @@ if st.session_state.collected and st.session_state.df is not None:
         st.warning("수집된 영상이 없습니다.")
         if errors:
             with st.expander(f"에러 로그 ({len(errors)}건)", expanded=True):
-                st.dataframe(pd.DataFrame(errors))
+                err_df = pd.DataFrame(errors)
+                st.dataframe(err_df, use_container_width=True)
+                # 봇 차단 여부 판단
+                if any("Sign in" in str(e.get('detail', '')) or "bot" in str(e.get('detail', ''))
+                       for e in errors):
+                    st.error(
+                        "🚫 **YouTube 봇 차단 감지.** "
+                        "사이드바에서 `cookies.txt`를 업로드하고 다시 시도하세요."
+                    )
         st.stop()
 
-    # metric 계산
     sub_text_cols = [c for c in df.columns if c.startswith('subtitle_text_')]
     if sub_text_cols:
         sub_count = df[sub_text_cols].apply(
-            lambda row: any(str(v).strip() not in ('', 'nan', 'None') for v in row),
-            axis=1
+            lambda row: any(
+                str(v).strip() not in ('', 'nan', 'None') for v in row
+            ), axis=1
         ).sum()
     else:
         sub_count = 0
