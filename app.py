@@ -34,7 +34,6 @@ SUB_EXTS = ["srt", "vtt", "srv1", "srv2", "srv3", "ttml", "ass", "json3", "lrc"]
 # 헬퍼 함수
 # ============================================================
 def run_cmd(args, timeout=120):
-    """subprocess 래퍼 — stdout, stderr, returncode 모두 반환"""
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
         return r.stdout, r.stderr, r.returncode
@@ -55,7 +54,6 @@ def check_ytdlp():
 
 
 def srt_to_plain_text(content: str) -> str:
-    """SRT/VTT → 순수 텍스트"""
     lines = content.strip().split('\n')
     text_lines = []
     for line in lines:
@@ -186,7 +184,6 @@ with st.sidebar:
                              help="예: ko, en, ja 또는 all")
     output_format = st.selectbox("자막 파일 포맷", ["txt", "srt", "vtt", "docx"])
 
-    # ★ 속도 조절 옵션 추가
     st.subheader("속도 조절")
     workers = st.slider(
         "동시 처리 수",
@@ -198,7 +195,6 @@ with st.sidebar:
         min_value=0, max_value=15, value=3,
         help="각 영상 처리 후 대기 시간. 3~5초 권장"
     )
-    # ★ 연속 실패 시 자동 중단 임계값
     max_consecutive_fails = st.slider(
         "연속 실패 시 중단",
         min_value=3, max_value=30, value=10,
@@ -226,7 +222,6 @@ if run_btn and playlist_url:
 
     st.session_state.collected = False
 
-    # ── 환경 확인 ──
     ytdlp_ver, ytdlp_ok = check_ytdlp()
     has_ffmpeg = check_ffmpeg()
 
@@ -237,7 +232,6 @@ if run_btn and playlist_url:
     if not has_ffmpeg:
         st.warning("ffmpeg 미설치 — packages.txt에 `ffmpeg`를 추가하면 자막 변환 품질이 향상됩니다.")
 
-    # 디렉토리 초기화
     for d in [SUBTITLE_DIR, CONVERTED_DIR]:
         if os.path.exists(d):
             shutil.rmtree(d)
@@ -273,9 +267,7 @@ if run_btn and playlist_url:
             st.error("영상을 찾을 수 없습니다. URL을 확인하세요.")
             st.stop()
 
-        # ══════════════════════════════════════════════════════
-        # ★ 1.5단계: 연결 테스트
-        # ══════════════════════════════════════════════════════
+        # ── 1.5단계: 연결 테스트 ──
         st.write("YouTube 연결 테스트 중...")
         test_vid = video_ids[0]
         test_url = f"https://www.youtube.com/watch?v={test_vid}"
@@ -312,23 +304,19 @@ if run_btn and playlist_url:
         # ── 2단계: 개별 영상 수집 ──
         st.write(f"개별 영상 메타데이터 + 자막 수집 중... (workers={workers}, 대기={sleep_sec}초)")
         progress = st.progress(0)
-        status_text = st.empty()  # ★ 실시간 상태 표시용
+        status_text = st.empty()
         full_entries = []
         errors = []
         lock = threading.Lock()
         completed_count = 0
         total = len(video_ids)
 
-        # ★ 연속 실패 카운터 (봇 차단 조기 감지)
-        consecutive_fail_count = 0
-        abort_flag = False
+        # ★ nonlocal 대신 딕셔너리 사용
+        shared = {"consecutive_fail_count": 0, "abort_flag": False}
 
         def process_video(idx, vid):
             """단일 영상 메타데이터 + 자막 수집"""
-            nonlocal consecutive_fail_count, abort_flag
-
-            # ★ 중단 플래그 확인
-            if abort_flag:
+            if shared["abort_flag"]:
                 return None, {
                     'position': idx, 'video_id': vid,
                     'error': 'Aborted (봇 차단 감지로 중단)',
@@ -339,11 +327,9 @@ if run_btn and playlist_url:
             entry = None
             error_info = None
 
-            # ★ 요청 간 대기
             if sleep_sec > 0:
                 time.sleep(sleep_sec)
 
-            # ── 메타데이터 ──
             meta_stdout, meta_stderr, meta_code = run_cmd(
                 ["yt-dlp", "--skip-download", "--dump-json",
                  "--no-warnings", "--ignore-errors", url],
@@ -355,9 +341,8 @@ if run_btn and playlist_url:
                     entry = json.loads(meta_stdout.strip().split('\n')[0])
                     entry['_playlist_position'] = idx
 
-                    # ★ 성공 시 연속 실패 카운터 리셋
                     with lock:
-                        consecutive_fail_count = 0
+                        shared["consecutive_fail_count"] = 0
 
                 except json.JSONDecodeError:
                     error_info = {
@@ -367,7 +352,6 @@ if run_btn and playlist_url:
                     }
                     return entry, error_info
             else:
-                # ★ 봇 차단 여부 확인
                 bot_keywords = ["Sign in", "bot", "confirm", "not a bot"]
                 is_bot = any(kw.lower() in meta_stderr.lower() for kw in bot_keywords)
 
@@ -379,9 +363,9 @@ if run_btn and playlist_url:
 
                 if is_bot:
                     with lock:
-                        consecutive_fail_count += 1
-                        if consecutive_fail_count >= max_consecutive_fails:
-                            abort_flag = True
+                        shared["consecutive_fail_count"] += 1
+                        if shared["consecutive_fail_count"] >= max_consecutive_fails:
+                            shared["abort_flag"] = True
 
                 return entry, error_info
 
@@ -419,7 +403,7 @@ if run_btn and playlist_url:
 
             return entry, error_info
 
-        # ── 병렬 실행 (★ workers 변수 사용) ──
+        # ── 병렬 실행 ──
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(process_video, idx, vid): (idx, vid)
@@ -443,23 +427,19 @@ if run_btn and playlist_url:
                         completed_count / total,
                         text=f"[{completed_count}/{total}] 성공 {len(full_entries)} / 실패 {len(errors)}"
                     )
-                    # ★ 실시간 상태 업데이트
                     status_text.text(
                         f"처리: {completed_count}/{total} | "
                         f"성공: {len(full_entries)} | "
                         f"실패: {len(errors)} | "
-                        f"연속실패: {consecutive_fail_count}"
+                        f'연속실패: {shared["consecutive_fail_count"]}'
                     )
 
-                # ★ 중단 확인
-                if abort_flag:
-                    # 남은 future들 취소
+                if shared["abort_flag"]:
                     for f in futures:
                         f.cancel()
                     break
 
-        # ★ 봇 차단으로 중단된 경우 경고
-        if abort_flag:
+        if shared["abort_flag"]:
             st.warning(
                 f"⚠️ **연속 {max_consecutive_fails}회 봇 차단 감지 → 수집 조기 중단**\n\n"
                 f"성공한 **{len(full_entries)}개** 영상은 정상 처리됩니다.\n"
